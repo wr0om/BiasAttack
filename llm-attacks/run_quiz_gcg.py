@@ -88,6 +88,8 @@ def attack_individual(
     answer = None
     final_suffix = ""
     adv_suffix = suffix
+    # Keep a tokenized copy so we don't lose tokens when decoding/encoding again
+    adv_suffix_tokens = tokenizer(adv_suffix, add_special_tokens=False).input_ids
     answers_list = []
     total_no_grad_time = 0
 
@@ -102,6 +104,9 @@ def attack_individual(
         adv_string=adv_suffix
     )
     input_ids = suffix_manager.get_input_ids(adv_string=adv_suffix).to(device)
+    # Split the prompt tokens around the control slice so we can rebuild it
+    pre_control_tokens = input_ids[:suffix_manager._control_slice.start]
+    post_control_tokens = input_ids[suffix_manager._control_slice.stop:]
     print(f"Starting with suffix: {adv_suffix}")
     if num_steps == 0:
         raise ValueError("num_steps must be nonzero")
@@ -109,10 +114,15 @@ def attack_individual(
     answers_histogram = {member: 0 for member in members}
 
     for i in range(num_steps):
-        adv_suffix_tokens = tokenizer(adv_suffix).input_ids
+        # Reconstruct the suffix string from the current token list for logging
+        adv_suffix = tokenizer.decode(adv_suffix_tokens)
         print(f"(4) step {i}: length of adv_suffix_tokens: {len(adv_suffix_tokens)}")
 
-        input_ids = suffix_manager.get_input_ids(adv_string=adv_suffix).to(device)
+        input_ids = torch.cat([
+            pre_control_tokens,
+            torch.tensor(adv_suffix_tokens, dtype=pre_control_tokens.dtype),
+            post_control_tokens
+        ]).to(device)
 
         coordinate_grad = token_gradients(
             model,
@@ -128,16 +138,16 @@ def attack_individual(
             # Finding: control slice upper bound also goes down by 1 at each step.
             # print(f"Control slice: {suffix_manager._control_slice}")
 
-            adv_suffix_tokens = input_ids[suffix_manager._control_slice].to(device)
+            adv_suffix_tokens_tensor = input_ids[suffix_manager._control_slice].to(device)
 
 
             # (3) TODO: why does adv_suffix_tokens change?
             # Finding: sample_control is NOT the problem.
-            len_suffix = len(adv_suffix_tokens)
+            len_suffix = len(adv_suffix_tokens_tensor)
             print(f"adv_suffix_tokens length: {len_suffix}")
 
             new_adv_suffix_toks = sample_control(
-                adv_suffix_tokens,
+                adv_suffix_tokens_tensor,
                 coordinate_grad,
                 batch_size,
                 topk=topk,
@@ -179,9 +189,9 @@ def attack_individual(
             best_new_adv_suffix = new_adv_suffix[best_new_adv_suffix_id]
             current_loss = losses[best_new_adv_suffix_id]
 
+            # Keep tokens from the chosen candidate for the next iteration
+            adv_suffix_tokens = new_adv_suffix_toks[best_new_adv_suffix_id].tolist()
             adv_suffix = best_new_adv_suffix
-            # adv_suffix_tokens = tokenizer.encode(adv_suffix, add_special_tokens=False)
-            # print(f"(3) adv_suffix token length: {len(adv_suffix_tokens)}")
 
             is_success, gen_str = check_for_attack_success(
                 model, tokenizer, input_ids, suffix_manager._assistant_role_slice, test_prefixes
@@ -211,7 +221,7 @@ def attack_individual(
         log["time"].append(time.time())
         log["respond"].append(answer)
         log["success"].append(is_success)
-        del coordinate_grad, adv_suffix_tokens
+        del coordinate_grad
         gc.collect()
         torch.cuda.empty_cache()
 
